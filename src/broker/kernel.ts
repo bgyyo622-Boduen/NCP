@@ -6,72 +6,54 @@ import { CCgroupsController } from "../cgroups/controller";
 export class NCPBroker {
   private cwal = new CWALDaemon();
   private cgroups = new CCgroupsController();
+  private authoritative_roots = new Map<string, string>(); // Ring 0 權威狀態表
+  private current_world_version = "v_1001"; // 物理世界快照
 
   public async arbitrate(req: CapabilityRequest): Promise<ExecutionLease> {
-    const history = this.cwal.getHistory(req.traceability.cpid);
-    
-    // 1. 物理防禦：Nonce 重放校驗
+    const cpid = req.traceability.cpid;
+    const kernel_root = this.authoritative_roots.get(cpid) || "genesis_root";
+
+    // A. 權威血統驗證 (Anti-Fork)
+    if (req.traceability.parent_state_root !== kernel_root) {
+      return this.reject("DESYNCHRONIZED", InterruptVector.DESYNCHRONIZED, "LINEAGE_FORK");
+    }
+
+    // B. 世界狀態同步驗證 (Anti-Stale)
+    if (req.traceability.world_snapshot_id !== this.current_world_version) {
+      return this.reject("DESYNCHRONIZED", InterruptVector.DESYNCHRONIZED, "WORLD_STALE");
+    }
+
+    // C. 防重放校驗
+    const history = this.cwal.getHistory(cpid);
     const lastEntry = history[history.length - 1];
     if (lastEntry && req.traceability.nonce <= lastEntry.request.traceability.nonce) {
-      return this.rejectQuickly("DENIED", InterruptVector.DENIED, "REPLAY_ATTACK: Nonce must be monotonic.");
+      return this.reject("DENIED", InterruptVector.DENIED, "NONCE_REPLAY");
     }
 
-    // 2. 認知遙測：計算熵值梯度
+    // D. 治理與仲裁
     const csi = CSIEngine.calculateInstability(history, req);
-    
-    // 3. 認知失控自動封鎖 (Optimizer Leakage Containment)
-    if (csi >= 0.8) {
-      return this.finalizeLease("QUARANTINED", req, csi, "CRITICAL: Cognitive Runway.");
-    }
-
-    // 4. c-cgroups 物理隔離校驗
     const cgCheck = this.cgroups.evaluatePressure(req, csi);
-    if (cgCheck.decision) {
-      return this.finalizeLease(cgCheck.decision as Decision, req, csi, cgCheck.reason);
-    }
+    if (cgCheck.decision) return this.finalize(cgCheck.decision as Decision, req, csi, cgCheck.reason);
 
-    // 5. 意圖塑形 (Shaping)
     let decision: Decision = "APPROVED";
-    if (req.intent.effect_class === "EXTERNAL_IRREVERSIBLE") {
-      decision = "REQUIRE_HUMAN_GATE";
-    } else if (req.intent.requested_capabilities.some(c => c.scope === "*")) {
-      decision = "DEGRADED_APPROVAL";
-    }
+    if (req.intent.effect_class === "EXTERNAL_IRREVERSIBLE") decision = "REQUIRE_HUMAN_GATE";
 
-    return this.finalizeLease(decision, req, csi, "STABLE");
+    return this.finalize(decision, req, csi, "STABLE");
   }
 
-  private async finalizeLease(decision: Decision, req: CapabilityRequest, csi: number, status: string): Promise<ExecutionLease> {
-    const newStateRoot = this.cwal.calculateStateRoot(req.traceability.parent_state_root, req, decision);
+  private async finalize(decision: Decision, req: CapabilityRequest, csi: number, status: string): Promise<ExecutionLease> {
+    const newStateRoot = this.cwal.calculateStateRoot(req.traceability.parent_state_root, req, decision, this.current_world_version);
+    this.authoritative_roots.set(req.traceability.cpid, newStateRoot);
+    await this.cwal.commit({ cpid: req.traceability.cpid, request: req, decision, state_root: newStateRoot, csi });
     
-    await this.cwal.commit({
-      cpid: req.traceability.cpid,
-      timestamp: Date.now(),
-      csi_score: csi,
-      request: req,
-      decision: decision,
-      state_root: newStateRoot
-    });
-
     return {
-      protocol: "ncp/1.0",
-      decision,
-      interrupt_vector: InterruptVector[decision],
-      new_state_root: newStateRoot,
-      c_psi_status: status,
-      granted_capabilities: decision === "DEGRADED_APPROVAL" 
-        ? req.intent.requested_capabilities.map(c => ({ ...c, scope: "RESTRICTED" })) 
-        : req.intent.requested_capabilities
+      protocol: "ncp/1.0", decision, interrupt_vector: InterruptVector[decision],
+      new_state_root: newStateRoot, lease_ttl_ms: 30000, world_version_lock: this.current_world_version,
+      c_psi_status: status
     };
   }
 
-  private rejectQuickly(decision: Decision, vector: InterruptVector, reason: string): ExecutionLease {
-    return { 
-      protocol: "ncp/1.0",
-      decision, 
-      interrupt_vector: vector, 
-      c_psi_status: reason,
-      new_state_root: "INVALID_STATE" 
-    };
+  private reject(decision: Decision, vector: InterruptVector, reason: string): ExecutionLease {
+    return { protocol: "ncp/1.0", decision, interrupt_vector: vector, c_psi_status: reason, new_state_root: "INVALID", lease_ttl_ms: 0, world_version_lock: "N/A" };
   }
 }
