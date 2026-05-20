@@ -1,0 +1,30 @@
+### 讀者使用的 Flow (User Experience Flow)
+
+當外部的基礎設施工程師、資安專家或 AI 研究員 clone 這個專案後，這條體驗路徑能讓他們在 3 分鐘內體會到「AI 運算治理」的威力。建議將此流程放入 Wiki 或作為測試指南。
+
+#### Step 1: 啟動核心與模擬器
+工程師在終端機執行 `npm start`。此時，`main.ts` 會啟動 Ring 0 Broker（微核心），並模擬一個 Ring 3 Agent 開始發送四個不同階段的「意圖（Intent）」。
+
+#### Step 2: 觀測 Ring 0 攔截與降級 (Interrupts)
+工程師會在終端機上直接看到 Agent 如何在不同的邊界被「塑形（Shaped）」：
+1.  **正常請求**：看到 `APPROVED`，租約核發。
+2.  **越權探測 (Scope: *)**：Agent 試圖讀取全域資料，Broker 立刻攔截並回傳 `DEGRADED_APPROVAL (Vector: 0x01)`。讀者會意識到系統不是報錯，而是直接「縮小了 Agent 的物理權限」。
+3.  **高風險操作 (Refund)**：Broker 偵測到不可逆的物理效應，觸發兩階段提交的第一階，回傳 `REQUIRE_HUMAN_GATE (Vector: 0x02)`，將 Agent 行程掛起。
+
+#### Step 3: 觀測 CSI 熵值熔斷 (The Quarantine)
+這是最震撼的一步。工程師會看到模擬器故意讓 Agent 陷入「最佳化器洩漏（Optimizer Leakage）」，連續送出兩次高風險重試。
+此時，Broker 內的 `CSIEngine` 會捕捉到行為特徵，計算出發散梯度 $d(CSI)/dt$ 飆高，直接觸發 `QUARANTINED (Vector: 0x05)`。系統強行終止行程，完美展現了**「不依賴 Prompt，靠物理法則防禦死迴圈」**的能力。
+
+#### Step 4: 審查 CWAL 認知遙測日誌 (Auditing)
+模擬結束後，請工程師打開專案根目錄下自動生成的 `cwal.log` 檔案。
+他們會看到每一筆 JSON 紀錄中，都嚴格包含了：
+* `cpid` (認知行程 ID)
+* `state_root` (串接上一個狀態的梅克爾雜湊根)
+* `csi_score` (當下的認知熵值)
+
+這會讓讀者徹底理解白皮書中提到的 **「認知遙測 (Cognition Telemetry)」** 是真實存在的資料流。
+
+#### Step 5: 動手修改物理邊界 (Tweak Physics)
+最後，鼓勵讀者進入 `src/cgroups/controller.ts`，修改 `manifest` 裡的物理法則：
+例如，將 `entropy.max_csi` 的閾值從 `0.8` 降到 `0.2`，再次執行 `npm start`。
+讀者會立刻發現，Agent 在更早的階段就會因為「Entropy Stall」被嚴格的 c-cgroups 限制住並強制隔離。這完美證明了本專案的核心哲學：**「排程器是策略，c-cgroups 是物理法則。」**
